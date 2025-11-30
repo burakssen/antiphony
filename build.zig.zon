@@ -1,10 +1,10 @@
 .{
-    .name = "antiphony",
+    .name = .antiphony,
     .version = "0.0.0",
     .dependencies = .{
         .s2s = .{
-            .url = "https://github.com/ziglibs/s2s/archive/b30205d5e9204899fb6d0fdf28d00ed4d18fe9c9.tar.gz",
-            .hash = "12202c39c98f05041f1052c268132669dbfcda87e4dbb0353cd84a6070924c8ac0e3",
+            .url = "git+https://github.com/burakssen/s2s#c48757afb221c003156e143787326c8e80875ee1",
+            .hash = "s2s-0.0.1-qt8ajZ98AACx_APAb4QftlxP9Ap3O6-lNejjB3YttSc1",
         },
     },
     .paths = .{
@@ -14,4 +14,5 @@
         //"LICENSE",
         //"README.md",
     },
+    .fingerprint = 0xc9c0a5e5ff3f18f0,
 }
