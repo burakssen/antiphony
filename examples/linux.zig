@@ -27,12 +27,20 @@ fn clientImplementation(file: std.fs.File) !void {
         }
     };
 
-    const EndPoint = RcpDefinition.ClientEndPoint(std.fs.File.Reader, std.fs.File.Writer, ClientImpl);
+    const EndPoint = RcpDefinition.ClientEndPoint(ClientImpl);
+
+    var reader_buffer: [1024]u8 = undefined;
+    var file_reader = file.reader(&reader_buffer);
+    const reader = &file_reader.interface;
+
+    var writer_buffer: [1024]u8 = undefined;
+    var file_writer = file.writer(&writer_buffer);
+    const writer = &file_writer.interface;
 
     var end_point = EndPoint.init(
         gpa.allocator(),
-        file.reader(),
-        file.writer(),
+        reader,
+        writer,
     );
     defer end_point.destroy();
 
@@ -58,8 +66,9 @@ fn hostImplementation(file: std.fs.File) !void {
     const HostImpl = struct {
         const Self = @This();
 
-        const EndPoint = RcpDefinition.HostEndPoint(std.fs.File.Reader, std.fs.File.Writer, Self);
+        const EndPoint = RcpDefinition.HostEndPoint(Self);
 
+        allocator: std.mem.Allocator,
         counters: std.ArrayList(?u32),
         end_point: *EndPoint,
 
@@ -68,10 +77,11 @@ fn hostImplementation(file: std.fs.File) !void {
         }
 
         pub fn createCounter(self: *Self) CreateError!u32 {
-            const index : u32 = @truncate(self.counters.items.len);
-            try self.counters.append(0);
+            const index: u32 = @truncate(self.counters.items.len);
+            try self.counters.append(self.allocator, 0);
             return index;
         }
+
         pub fn destroyCounter(self: *Self, handle: u32) void {
             if (handle >= self.counters.items.len) {
                 self.sendErrorMessage("unknown counter");
@@ -107,18 +117,27 @@ fn hostImplementation(file: std.fs.File) !void {
         }
     };
 
+    var reader_buffer: [1024]u8 = undefined;
+    var file_reader = file.reader(&reader_buffer);
+    const reader = &file_reader.interface;
+
+    var writer_buffer: [1024]u8 = undefined;
+    var file_writer = file.writer(&writer_buffer);
+    const writer = &file_writer.interface;
+
     var end_point = HostImpl.EndPoint.init(
         gpa.allocator(), // we need some basic session management
-        file.reader(), // data input
-        file.writer(), // data output
+        reader, // data input
+        writer, // data output
     );
     defer end_point.destroy();
 
     var impl = HostImpl{
-        .counters = std.ArrayList(?u32).init(gpa.allocator()),
+        .allocator = gpa.allocator(),
+        .counters = .empty,
         .end_point = &end_point,
     };
-    defer impl.counters.deinit();
+    defer impl.counters.deinit(gpa.allocator());
 
     try end_point.connect(&impl); // establish RPC handshake
 

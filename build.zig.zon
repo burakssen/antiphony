@@ -3,8 +3,8 @@
     .version = "0.0.0",
     .dependencies = .{
         .s2s = .{
-            .url = "git+https://github.com/burakssen/s2s#c48757afb221c003156e143787326c8e80875ee1",
-            .hash = "s2s-0.0.1-qt8ajZ98AACx_APAb4QftlxP9Ap3O6-lNejjB3YttSc1",
+            .url = "git+https://github.com/ziglibs/s2s#eeccd16e60ef9fd7fbb9a3b1b82e88f74f7631f0",
+            .hash = "s2s-0.0.1-qt8ajYV8AAB9m_WoCGu-BRH1ghuvFbK_BuMfhXYJ0mCg",
         },
     },
     .paths = .{
