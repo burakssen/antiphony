@@ -31,22 +31,21 @@ fn clientImplementation(file: std.fs.File) !void {
 
     var reader_buffer: [1024]u8 = undefined;
     var file_reader = file.reader(&reader_buffer);
-    const reader = &file_reader.interface;
 
     var writer_buffer: [1024]u8 = undefined;
     var file_writer = file.writer(&writer_buffer);
-    const writer = &file_writer.interface;
 
     var end_point = EndPoint.init(
         gpa.allocator(),
-        reader,
-        writer,
+        &file_reader.interface,
+        &file_writer.interface,
     );
     defer end_point.destroy();
 
     var impl = ClientImpl{};
+    std.debug.print("Client connecting to host\n", .{});
     try end_point.connect(&impl); // establish RPC handshake
-
+    std.debug.print("Client connected to host\n", .{});
     const handle = try end_point.invoke("createCounter", .{});
 
     std.log.info("first increment:  {}", .{try end_point.invoke("increment", .{ handle, 5 })});
@@ -57,6 +56,8 @@ fn clientImplementation(file: std.fs.File) !void {
     try end_point.invoke("destroyCounter", .{handle});
 
     _ = end_point.invoke("getCount", .{handle}) catch |err| std.log.info("error while calling getCount()  with invalid handle: {s}", .{@errorName(err)});
+
+    try end_point.shutdown();
 }
 
 fn hostImplementation(file: std.fs.File) !void {
@@ -81,7 +82,6 @@ fn hostImplementation(file: std.fs.File) !void {
             try self.counters.append(self.allocator, 0);
             return index;
         }
-
         pub fn destroyCounter(self: *Self, handle: u32) void {
             if (handle >= self.counters.items.len) {
                 self.sendErrorMessage("unknown counter");
@@ -119,16 +119,14 @@ fn hostImplementation(file: std.fs.File) !void {
 
     var reader_buffer: [1024]u8 = undefined;
     var file_reader = file.reader(&reader_buffer);
-    const reader = &file_reader.interface;
 
     var writer_buffer: [1024]u8 = undefined;
     var file_writer = file.writer(&writer_buffer);
-    const writer = &file_writer.interface;
 
     var end_point = HostImpl.EndPoint.init(
         gpa.allocator(), // we need some basic session management
-        reader, // data input
-        writer, // data output
+        &file_reader.interface, // data input
+        &file_writer.interface, // data output
     );
     defer end_point.destroy();
 
@@ -146,9 +144,13 @@ fn hostImplementation(file: std.fs.File) !void {
 
 // This main function just creates a socket pair and hands them off to two threads that perform some RPC calls.
 pub fn main() !void {
-    var sockets: [2]i32 = undefined;
-    if (std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &sockets) != 0)
+    const c = std.c;
+    var sockets: [2]c.fd_t = undefined;
+
+    // Use C socketpair which works on macOS
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &sockets) != 0) {
         return error.SocketPairError;
+    }
 
     var socket_a = std.fs.File{ .handle = sockets[0] };
     defer socket_a.close();

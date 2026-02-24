@@ -49,15 +49,15 @@ pub fn CreateDefinition(comptime spec: anytype) type {
     return struct {
         const Self = @This();
 
-        pub fn HostEndPoint(comptime Reader: type, comptime Writer: type, comptime Implementation: type) type {
-            return CreateEndPoint(.host, Reader, Writer, Implementation);
+        pub fn HostEndPoint(comptime Implementation: type) type {
+            return CreateEndPoint(.host, Implementation);
         }
 
-        pub fn ClientEndPoint(comptime Reader: type, comptime Writer: type, comptime Implementation: type) type {
-            return CreateEndPoint(.client, Reader, Writer, Implementation);
+        pub fn ClientEndPoint(comptime Implementation: type) type {
+            return CreateEndPoint(.client, Implementation);
         }
 
-        pub fn CreateEndPoint(comptime role: Role, comptime ReaderType: type, comptime WriterType: type, comptime ImplementationType: type) type {
+        pub fn CreateEndPoint(comptime role: Role, comptime ImplementationType: type) type {
             const inbound_spec = switch (role) {
                 .host => host_spec,
                 .client => client_spec,
@@ -78,23 +78,21 @@ pub fn CreateDefinition(comptime spec: anytype) type {
 
             return struct {
                 const EndPoint = @This();
-                pub const Reader = ReaderType;
-                pub const Writer = WriterType;
                 pub const Implementation = ImplementationType;
 
-                pub const IoError = Reader.Error || Writer.Error || error{EndOfStream};
+                pub const IoError = std.Io.Reader.Error || std.Io.Writer.Error || error{EndOfStream};
                 pub const ProtocolError = error{ ProtocolViolation, InvalidProtocol, ProtocolMismatch };
                 pub const InvokeError = IoError || ProtocolError || std.mem.Allocator.Error;
                 pub const ConnectError = IoError || ProtocolError;
 
                 allocator: std.mem.Allocator,
-                reader: Reader,
-                writer: Writer,
+                reader: *std.Io.Reader,
+                writer: *std.Io.Writer,
 
                 sequence_id: u32 = 0,
                 impl: ?*Implementation = null,
 
-                pub fn init(allocator: std.mem.Allocator, reader: Reader, writer: Writer) EndPoint {
+                pub fn init(allocator: std.mem.Allocator, reader: *std.Io.Reader, writer: *std.Io.Writer) EndPoint {
                     return EndPoint{
                         .allocator = allocator,
                         .reader = reader,
@@ -112,17 +110,16 @@ pub fn CreateDefinition(comptime spec: anytype) type {
                 /// Performs the initial handshake with the remote peer.
                 /// Both agree on the used RPC version and that they use the same protocol.
                 pub fn connect(self: *EndPoint, impl: *Implementation) ConnectError!void {
-                    std.debug.assert(self.impl == null); // do not call twice
-
                     try self.writer.writeAll(&protocol_magic);
                     try self.writer.writeByte(current_version); // version byte
+                    try self.writer.flush();
 
                     var remote_magic: [4]u8 = undefined;
-                    try self.reader.readNoEof(&remote_magic);
+                    try self.reader.readSliceAll(&remote_magic);
                     if (!std.mem.eql(u8, &protocol_magic, &remote_magic))
                         return error.InvalidProtocol;
 
-                    const remote_version = try self.reader.readByte();
+                    const remote_version = try self.reader.takeByte();
                     if (remote_version != current_version)
                         return error.ProtocolMismatch;
 
@@ -135,6 +132,7 @@ pub fn CreateDefinition(comptime spec: anytype) type {
                 pub fn shutdown(self: *EndPoint) IoError!void {
                     std.debug.assert(self.impl != null); // call these only after a successful connection!
                     try self.writer.writeByte(@intFromEnum(CommandId.shutdown));
+                    try self.writer.flush();
                 }
 
                 /// Waits for incoming calls and handles them till the client shuts down the connection.
@@ -143,7 +141,7 @@ pub fn CreateDefinition(comptime spec: anytype) type {
                 pub fn acceptCalls(self: *EndPoint) InvokeError!void {
                     std.debug.assert(self.impl != null); // call these only after a successful connection!
                     while (true) {
-                        const cmd_id = try self.reader.readByte();
+                        const cmd_id = try self.reader.takeByte();
                         const cmd = std.meta.intToEnum(CommandId, cmd_id) catch return error.ProtocolViolation;
                         switch (cmd) {
                             .call => {
@@ -157,16 +155,16 @@ pub fn CreateDefinition(comptime spec: anytype) type {
 
                 pub fn InvokeReturnType(comptime func_name: []const u8) type {
                     const FuncPrototype = @field(outbound_spec, func_name);
-                    const func_info = @typeInfo(FuncPrototype).Fn;
+                    const func_info = @typeInfo(FuncPrototype).@"fn";
                     const FuncReturnType = func_info.return_type.?;
 
                     if (config.merge_error_sets) {
                         switch (@typeInfo(FuncReturnType)) {
                             // We merge error sets, but still return the original function payload
-                            .ErrorUnion => |eu| return (InvokeError || eu.error_set)!eu.payload,
+                            .error_union => |eu| return (InvokeError || eu.error_set)!eu.payload,
 
                             // we just merge error sets, the result will be `void` in *no* case (but makes handling easier)
-                            .ErrorSet => return (InvokeError || FuncReturnType)!void,
+                            .error_set => return (InvokeError || FuncReturnType)!void,
 
                             // The function doesn't return an error, so we just return InvokeError *or* the function return value.
                             else => return InvokeError!FuncReturnType,
@@ -199,7 +197,7 @@ pub fn CreateDefinition(comptime spec: anytype) type {
                     std.debug.assert(self.impl != null); // call these only after a successful connection!
                     const FuncPrototype = @field(outbound_spec, func_name);
                     const ArgsTuple = std.meta.ArgsTuple(FuncPrototype);
-                    const func_info = @typeInfo(FuncPrototype).Fn;
+                    const func_info = @typeInfo(FuncPrototype).@"fn";
 
                     var arg_list: ArgsTuple = undefined;
 
@@ -220,6 +218,8 @@ pub fn CreateDefinition(comptime spec: anytype) type {
                     try self.writer.writeInt(u32, func_name.len, .little);
                     try self.writer.writeAll(func_name);
                     try s2s.serialize(self.writer, ArgsTuple, arg_list);
+
+                    try self.writer.flush();
 
                     try self.waitForResponse(sequence_id);
 
@@ -245,9 +245,9 @@ pub fn CreateDefinition(comptime spec: anytype) type {
                         const result = s2s.deserialize(self.reader, InvocationResult(FuncReturnType)) catch return error.ProtocolViolation;
 
                         if (config.merge_error_sets) {
-                            if (@typeInfo(FuncReturnType) == .ErrorUnion) {
+                            if (@typeInfo(FuncReturnType) == .error_union) {
                                 return try result.unwrap();
-                            } else if (@typeInfo(FuncReturnType) == .ErrorSet) {
+                            } else if (@typeInfo(FuncReturnType) == .error_set) {
                                 return result.unwrap();
                             } else {
                                 return result.unwrap();
@@ -264,14 +264,14 @@ pub fn CreateDefinition(comptime spec: anytype) type {
                 /// Leaves the reader in a state so the response can be deserialized directly from the stream.
                 fn waitForResponse(self: *EndPoint, sequence_id: SequenceID) !void {
                     while (true) {
-                        const cmd_id = try self.reader.readByte();
+                        const cmd_id = try self.reader.takeByte();
                         const cmd = std.meta.intToEnum(CommandId, cmd_id) catch return error.ProtocolViolation;
                         switch (cmd) {
                             .call => {
                                 try self.processCall();
                             },
                             .response => {
-                                const seq = @as(SequenceID,@enumFromInt(try self.reader.readInt(u32, .little)));
+                                const seq = @as(SequenceID, @enumFromInt(try self.reader.takeInt(u32, .little)));
                                 if (seq != sequence_id)
                                     return error.ProtocolViolation;
                                 return;
@@ -283,13 +283,13 @@ pub fn CreateDefinition(comptime spec: anytype) type {
 
                 /// Deserializes call information
                 fn processCall(self: *EndPoint) !void {
-                    const sequence_id = @as(SequenceID,@enumFromInt(try self.reader.readInt(u32, .little)));
-                    const name_length = try self.reader.readInt(u32, .little);
+                    const sequence_id = @as(SequenceID, @enumFromInt(try self.reader.takeInt(u32, .little)));
+                    const name_length = try self.reader.takeInt(u32, .little);
                     if (name_length > max_received_func_name_len)
                         return error.ProtocolViolation;
                     var name_buffer: [max_received_func_name_len]u8 = undefined;
                     const function_name = name_buffer[0..name_length];
-                    try self.reader.readNoEof(function_name);
+                    try self.reader.readSliceAll(function_name);
 
                     inline for (std.meta.fields(InboundSpec)) |fld| {
                         if (std.mem.eql(u8, fld.name, function_name)) {
@@ -309,13 +309,13 @@ pub fn CreateDefinition(comptime spec: anytype) type {
 
                     const ImplFunc = @TypeOf(impl_func);
 
-                    const SpecReturnType = @typeInfo(FuncSpec).Fn.return_type.?;
+                    const SpecReturnType = @typeInfo(FuncSpec).@"fn".return_type.?;
 
                     const impl_func_info = @typeInfo(ImplFunc);
-                    if (impl_func_info != .Fn)
+                    if (impl_func_info != .@"fn")
                         @compileError(@typeName(Implementation) ++ "." ++ function_name ++ " must be a function with invocable signature " ++ @typeName(FuncSpec));
 
-                    const impl_func_fn = impl_func_info.Fn;
+                    const impl_func_fn = impl_func_info.@"fn";
 
                     var invocation_args: FuncArgs = s2s.deserializeAlloc(self.reader, FuncArgs, self.allocator) catch |err| switch (err) {
                         error.UnexpectedData => return error.ProtocolViolation,
@@ -345,7 +345,7 @@ pub fn CreateDefinition(comptime spec: anytype) type {
                             break :b @call(.auto, impl_func, .{proxy} ++ invocation_args);
                         }
                         // invocation with self
-                        else if (@typeInfo(Arg0Type) == .Pointer)
+                        else if (@typeInfo(Arg0Type) == .pointer)
                             @call(.auto, impl_func, .{self.impl.?} ++ invocation_args)
                         else
                             @call(.auto, impl_func, .{self.impl.?.*} ++ invocation_args);
@@ -354,6 +354,7 @@ pub fn CreateDefinition(comptime spec: anytype) type {
                     try self.writer.writeByte(@intFromEnum(CommandId.response));
                     try self.writer.writeInt(u32, @intFromEnum(sequence_id), .little);
                     try s2s.serialize(self.writer, InvocationResult(SpecReturnType), invocationResult(SpecReturnType, result));
+                    try self.writer.flush();
                 }
 
                 fn nextSequenceID(self: *EndPoint) SequenceID {
@@ -412,10 +413,10 @@ fn validateSpec(comptime funcs: anytype) void {
             @compileError("All fields of .host or .client must be function types!");
         const field_info = @typeInfo(@field(funcs, fld.name));
 
-        if (field_info != .Fn)
+        if (field_info != .@"fn")
             @compileError("All fields of .host or .client must be function types!");
 
-        const func_info: std.builtin.Type.Fn = field_info.Fn;
+        const func_info: std.builtin.Type.Fn = field_info.@"fn";
         if (func_info.is_generic) @compileError("Cannot handle generic functions");
         for (func_info.params) |param| {
             if (param.is_generic) @compileError("Cannot handle generic functions");
@@ -453,30 +454,27 @@ test "invoke function (emulated host)" {
 
     const ClientImpl = struct {};
 
-    var output_stream = std.ArrayList(u8).init(std.testing.allocator);
+    var output_stream: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output_stream.deinit();
 
-    const input_data = comptime blk: {
-        var buffer: [4096]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&buffer);
-        var writer = stream.writer();
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
 
-        try writer.writeAll(&protocol_magic);
-        try writer.writeByte(current_version);
+    try writer.writeAll(&protocol_magic);
+    try writer.writeByte(current_version);
 
-        try writer.writeByte(@intFromEnum(CommandId.response));
-        try writer.writeInt(u32, 0, .little); // first sequence id
+    try writer.writeByte(@intFromEnum(CommandId.response));
+    try writer.writeInt(u32, 0, .little); // first sequence id
 
-        try s2s.serialize(writer, InvocationResult(void), invocationResult(void, {}));
+    try s2s.serialize(&writer, InvocationResult(void), invocationResult(void, {}));
+    try writer.flush();
+    const input_data = writer.buffered();
 
-        break :blk stream.getWritten();
-    };
-    var input_stream = std.io.fixedBufferStream(@as([]const u8, input_data));
+    var input_stream: std.Io.Reader = .fixed(input_data);
 
-    const EndPoint = RcpDefinition.ClientEndPoint(std.io.FixedBufferStream([]const u8).Reader, std.ArrayList(u8).Writer, ClientImpl);
+    const EndPoint = RcpDefinition.ClientEndPoint(ClientImpl);
 
-    var end_point = EndPoint.init(std.testing.allocator, input_stream.reader(), output_stream.writer());
-
+    var end_point = EndPoint.init(std.testing.allocator, &input_stream, &output_stream.writer);
     var impl = ClientImpl{};
     try end_point.connect(&impl);
 
@@ -497,41 +495,41 @@ test "invoke function (emulated client, no self parameter)" {
     const HostImpl = struct {
         fn some(a: u32, b: f32, c: []const u8) u32 {
             std.debug.print("some({}, {d}, \"{s}\");\n", .{ a, b, c });
-            return a + @as(u32,@intFromFloat(b));
+            return a + @as(u32, @intFromFloat(b));
         }
     };
 
-    var output_stream = std.ArrayList(u8).init(std.testing.allocator);
+    var output_stream: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output_stream.deinit();
 
-    const input_data = comptime blk: {
-        var buffer: [4096]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&buffer);
-        var writer = stream.writer();
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
 
-        try writer.writeAll(&protocol_magic);
-        try writer.writeByte(current_version);
+    try writer.writeAll(&protocol_magic);
+    try writer.writeByte(current_version);
 
-        try writer.writeByte(@intFromEnum(CommandId.call));
-        try writer.writeInt(u32, 1337, .little); // first sequence id
-        try writer.writeInt(u32, "some".len, .little);
-        try writer.writeAll("some");
+    try writer.writeByte(@intFromEnum(CommandId.call));
+    try writer.writeInt(u32, 1337, .little); // first sequence id
+    try writer.writeInt(u32, "some".len, .little);
+    try writer.writeAll("some");
 
-        try s2s.serialize(writer, std.meta.Tuple(&.{ u32, f32, []const u8 }), .{
-            .@"0" = 1334,
-            .@"1" = std.math.pi,
-            .@"2" = "Hello, Host!",
-        });
+    try s2s.serialize(&writer, std.meta.Tuple(&.{ u32, f32, []const u8 }), .{
+        .@"0" = 1334,
+        .@"1" = std.math.pi,
+        .@"2" = "Hello, Host!",
+    });
 
-        try writer.writeByte(@intFromEnum(CommandId.shutdown));
+    try writer.writeByte(@intFromEnum(CommandId.shutdown));
 
-        break :blk stream.getWritten();
-    };
-    var input_stream = std.io.fixedBufferStream(@as([]const u8, input_data));
+    try writer.flush();
 
-    const EndPoint = RcpDefinition.HostEndPoint(std.io.FixedBufferStream([]const u8).Reader, std.ArrayList(u8).Writer, HostImpl);
+    const input_data = writer.buffered();
 
-    var end_point = EndPoint.init(std.testing.allocator, input_stream.reader(), output_stream.writer());
+    var input_stream: std.Io.Reader = .fixed(input_data);
+
+    const EndPoint = RcpDefinition.HostEndPoint(HostImpl);
+
+    var end_point = EndPoint.init(std.testing.allocator, &input_stream, &output_stream.writer);
 
     var impl = HostImpl{};
     try end_point.connect(&impl);
@@ -555,41 +553,41 @@ test "invoke function (emulated client, with self parameter)" {
 
         fn some(self: @This(), a: u32, b: f32, c: []const u8) u32 {
             std.debug.print("some({}, {}, {d}, \"{s}\");\n", .{ self.dummy, a, b, c });
-            return a + @as(u32,@intFromFloat(b));
+            return a + @as(u32, @intFromFloat(b));
         }
     };
 
-    var output_stream = std.ArrayList(u8).init(std.testing.allocator);
+    var output_stream: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output_stream.deinit();
 
-    const input_data = comptime blk: {
-        var buffer: [4096]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&buffer);
-        var writer = stream.writer();
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
 
-        try writer.writeAll(&protocol_magic);
-        try writer.writeByte(current_version);
+    try writer.writeAll(&protocol_magic);
+    try writer.writeByte(current_version);
 
-        try writer.writeByte(@intFromEnum(CommandId.call));
-        try writer.writeInt(u32, 1337, .little); // first sequence id
-        try writer.writeInt(u32, "some".len, .little);
-        try writer.writeAll("some");
+    try writer.writeByte(@intFromEnum(CommandId.call));
+    try writer.writeInt(u32, 1337, .little); // first sequence id
+    try writer.writeInt(u32, "some".len, .little);
+    try writer.writeAll("some");
 
-        try s2s.serialize(writer, std.meta.Tuple(&.{ u32, f32, []const u8 }), .{
-            .@"0" = 1334,
-            .@"1" = std.math.pi,
-            .@"2" = "Hello, Host!",
-        });
+    try s2s.serialize(&writer, std.meta.Tuple(&.{ u32, f32, []const u8 }), .{
+        .@"0" = 1334,
+        .@"1" = std.math.pi,
+        .@"2" = "Hello, Host!",
+    });
 
-        try writer.writeByte(@intFromEnum(CommandId.shutdown));
+    try writer.writeByte(@intFromEnum(CommandId.shutdown));
 
-        break :blk stream.getWritten();
-    };
-    var input_stream = std.io.fixedBufferStream(@as([]const u8, input_data));
+    try writer.flush();
 
-    const EndPoint = RcpDefinition.HostEndPoint(std.io.FixedBufferStream([]const u8).Reader, std.ArrayList(u8).Writer, HostImpl);
+    const input_data = writer.buffered();
 
-    var end_point = EndPoint.init(std.testing.allocator, input_stream.reader(), output_stream.writer());
+    var input_stream: std.Io.Reader = .fixed(input_data);
+
+    const EndPoint = RcpDefinition.HostEndPoint(HostImpl);
+
+    var end_point = EndPoint.init(std.testing.allocator, &input_stream, &output_stream.writer);
 
     var impl = HostImpl{ .dummy = 123 };
     try end_point.connect(&impl);
@@ -616,39 +614,38 @@ test "invoke function with callback (emulated host, no self parameter)" {
         }
     };
 
-    var output_stream = std.ArrayList(u8).init(std.testing.allocator);
+    var output_stream: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output_stream.deinit();
 
-    const input_data = comptime blk: {
-        var buffer: [4096]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&buffer);
-        var writer = stream.writer();
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
 
-        try writer.writeAll(&protocol_magic);
-        try writer.writeByte(current_version);
+    try writer.writeAll(&protocol_magic);
+    try writer.writeByte(current_version);
 
-        try writer.writeByte(@intFromEnum(CommandId.call));
-        try writer.writeInt(u32, 1337, .little); // first sequence id
-        try writer.writeInt(u32, "callback".len, .little);
-        try writer.writeAll("callback");
+    try writer.writeByte(@intFromEnum(CommandId.call));
+    try writer.writeInt(u32, 1337, .little); // first sequence id
+    try writer.writeInt(u32, "callback".len, .little);
+    try writer.writeAll("callback");
 
-        try s2s.serialize(writer, std.meta.Tuple(&.{[]const u8}), .{
-            .@"0" = "Hello, World!",
-        });
+    try s2s.serialize(&writer, std.meta.Tuple(&.{[]const u8}), .{
+        .@"0" = "Hello, World!",
+    });
 
-        try writer.writeByte(@intFromEnum(CommandId.response));
-        try writer.writeInt(u32, 0, .little); // first sequence id
+    try writer.writeByte(@intFromEnum(CommandId.response));
+    try writer.writeInt(u32, 0, .little); // first sequence id
 
-        try s2s.serialize(writer, InvocationResult(void), invocationResult(void, {}));
+    try s2s.serialize(&writer, InvocationResult(void), invocationResult(void, {}));
 
-        break :blk stream.getWritten();
-    };
-    var input_stream = std.io.fixedBufferStream(@as([]const u8, input_data));
+    try writer.flush();
 
-    const EndPoint = RcpDefinition.ClientEndPoint(std.io.FixedBufferStream([]const u8).Reader, std.ArrayList(u8).Writer, ClientImpl);
+    const input_data = writer.buffered();
 
-    var end_point = EndPoint.init(std.testing.allocator, input_stream.reader(), output_stream.writer());
+    var input_stream: std.Io.Reader = .fixed(input_data);
 
+    const EndPoint = RcpDefinition.ClientEndPoint(ClientImpl);
+
+    var end_point = EndPoint.init(std.testing.allocator, &input_stream, &output_stream.writer);
     var impl = ClientImpl{};
     try end_point.connect(&impl);
 
@@ -676,38 +673,38 @@ test "invoke function with callback (emulated host, with self parameter)" {
         }
     };
 
-    var output_stream = std.ArrayList(u8).init(std.testing.allocator);
+    var output_stream: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output_stream.deinit();
 
-    const input_data = comptime blk: {
-        var buffer: [4096]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&buffer);
-        var writer = stream.writer();
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
 
-        try writer.writeAll(&protocol_magic);
-        try writer.writeByte(current_version);
+    try writer.writeAll(&protocol_magic);
+    try writer.writeByte(current_version);
 
-        try writer.writeByte(@intFromEnum(CommandId.call));
-        try writer.writeInt(u32, 1337, .little); // first sequence id
-        try writer.writeInt(u32, "callback".len, .little);
-        try writer.writeAll("callback");
+    try writer.writeByte(@intFromEnum(CommandId.call));
+    try writer.writeInt(u32, 1337, .little); // first sequence id
+    try writer.writeInt(u32, "callback".len, .little);
+    try writer.writeAll("callback");
 
-        try s2s.serialize(writer, std.meta.Tuple(&.{[]const u8}), .{
-            .@"0" = "Hello, World!",
-        });
+    try s2s.serialize(&writer, std.meta.Tuple(&.{[]const u8}), .{
+        .@"0" = "Hello, World!",
+    });
 
-        try writer.writeByte(@intFromEnum(CommandId.response));
-        try writer.writeInt(u32, 0, .little); // first sequence id
+    try writer.writeByte(@intFromEnum(CommandId.response));
+    try writer.writeInt(u32, 0, .little); // first sequence id
 
-        try s2s.serialize(writer, InvocationResult(void), invocationResult(void, {}));
+    try s2s.serialize(&writer, InvocationResult(void), invocationResult(void, {}));
 
-        break :blk stream.getWritten();
-    };
-    var input_stream = std.io.fixedBufferStream(@as([]const u8, input_data));
+    try writer.flush();
 
-    const EndPoint = RcpDefinition.ClientEndPoint(std.io.FixedBufferStream([]const u8).Reader, std.ArrayList(u8).Writer, ClientImpl);
+    const input_data = writer.buffered();
 
-    var end_point = EndPoint.init(std.testing.allocator, input_stream.reader(), output_stream.writer());
+    var input_stream: std.Io.Reader = .fixed(input_data);
+
+    const EndPoint = RcpDefinition.ClientEndPoint(ClientImpl);
+
+    var end_point = EndPoint.init(std.testing.allocator, &input_stream, &output_stream.writer);
 
     var impl = ClientImpl{};
     try end_point.connect(&impl);
